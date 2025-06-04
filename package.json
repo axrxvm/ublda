@@ -1,0 +1,28 @@
+{
+  "name": "ublda",
+  "version": "1.0.0",
+  "description": "Universal Block-Level Data Accelerator for efficient, deduplicated file storage",
+  "main": "./src/index.js",
+  "type": "module",
+  "bin": {
+    "ublda": "./bin/cli.js"
+  },
+  "scripts": {
+    "test": "node test/ublda.test.js",
+    "hm": "node ublda.js store input.txt --block-size 8192 --storage ./data --compress --verbose"
+  },
+  "keywords": [
+    "deduplication",
+    "storage",
+    "block-level",
+    "content-addressable"
+  ],
+  "author": "Aarav Mehta",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^9.4.1",
+    "fs-extra": "^10.1.0",
+    "p-limit": "^3.1.0",
+    "progress": "^2.0.3"
+  }
+}
