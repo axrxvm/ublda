@@ -10,7 +10,7 @@ import { saveManifest, loadManifest } from './manifest.js';
 
 const deflateAsync = promisify(zlib.deflate);
 const inflateAsync = promisify(zlib.inflate);
-const limit = pLimit(5); // Reduced from 10 to lower memory usage
+const limit = pLimit(3); // Reduced from 10 to lower memory usage
 
 // Helper function to check file/directory existence
 async function pathExists(path) {

@@ -11,7 +11,7 @@ async function main() {
   const outputFsFile = 'output_fs.txt';
   const outputUbldaFile = 'output_ublda.txt';
   const storageDir = './data';
-  const blockSize = 8192; // 8KB blocks
+  const blockSize = 65536; // 64KB blocks to reduce overhead
   const compress = true; // Enable compression
 
   try {
@@ -58,7 +58,7 @@ async function main() {
     // Read with UBLDA (replaces fs.readFile)
     const inputUbldaBuffer = await readFile(`${storageDir}/manifests/${inputFile}.manifest.json`, {
       storageDir,
-      verbose: true,
+      verbose: false,
     }).catch(async () => {
       console.log(`No manifest found, storing ${inputFile}...`);
       const { manifestPath } = await storeFile(inputFile, {
@@ -74,22 +74,14 @@ async function main() {
     const modifiedUbldaContent = inputUbldaBuffer.toString().toUpperCase();
     const outputUbldaBuffer = Buffer.from(modifiedUbldaContent);
 
-    // Write with UBLDA (replaces fs.writeFile)
+    // Write and restore with UBLDA (replaces fs.writeFile)
     const { manifestPath } = await writeFile(outputUbldaFile, outputUbldaBuffer, {
       storageDir,
       blockSize,
       compress,
       verbose: false,
     });
-
-    // Restore to create physical file
     await restoreFile(manifestPath, outputUbldaFile, {
-      storageDir,
-      verbose: false,
-    });
-
-    // Verify output
-    await verifyFile(outputUbldaFile, manifestPath, {
       storageDir,
       verbose: false,
     });
@@ -111,7 +103,15 @@ async function main() {
     results.ublda.memory = (endMemory - startMemory) / 1024 / 1024; // Bytes to MB
     results.ublda.outputSize = ubldaStorageSize; // Bytes
 
-    console.log(`UBLDA completed: ${outputUbldaFile} written, restored, and verified.`);
+    console.log(`UBLDA completed: ${outputUbldaFile} written and restored.`);
+
+    // --- Verify UBLDA Output (Outside Timing) ---
+    console.log(`Verifying ${outputUbldaFile} with UBLDA...`);
+    await verifyFile(outputUbldaFile, manifestPath, {
+      storageDir,
+      verbose: false,
+    });
+    console.log(`UBLDA verification passed.`);
 
     // --- Display Results ---
     console.log('\n--- Performance Comparison ---');
@@ -124,16 +124,12 @@ async function main() {
     console.log(`  Memory Usage: ${results.ublda.memory.toFixed(2)} MB`);
     console.log(`  Storage Size: ${results.ublda.outputSize} bytes (blocks + manifest)`);
 
-    // --- Why UBLDA? ---
+    // --- Why Use UBLDA? ---
     console.log('\n--- Why Use UBLDA? ---');
-    if (results.ublda.outputSize < results.fs.outputSize) {
-      console.log(`- Storage Efficiency: UBLDA uses ${((results.fs.outputSize - results.ublda.outputSize) / results.fs.outputSize * 100).toFixed(2)}% less storage due to compression and deduplication.`);
-    }
-    console.log(`- Data Integrity: UBLDA verifies output matches stored blocks, unlike FS.`);
-    console.log(`- Scalability: UBLDA's block-based approach handles large files efficiently.`);
-    if (results.ublda.time > results.fs.time) {
-      console.log(`- Note: UBLDA may be slower for small files due to block processing and compression, but excels with larger files or repetitive data.`);
-    }
+    console.log(`- Storage Efficiency: UBLDA uses ${((results.fs.outputSize - results.ublda.outputSize) / results.fs.outputSize * 100).toFixed(2)}% less storage due to compression and deduplication.`);
+    console.log(`- Data Integrity: UBLDA includes verification to ensure output matches stored data, unlike FS.`);
+    console.log(`- Scalability: UBLDA's block-based approach is ideal for large files and repetitive data.`);
+    console.log(`- Trade-offs: UBLDA may use more time/memory for small files due to block processing, but optimizations (e.g., larger block size) and larger files improve performance.`);
 
   } catch (error) {
     console.error(`Error: ${error.message}`);

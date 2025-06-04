@@ -9,7 +9,7 @@
   },
   "scripts": {
     "test": "node test/ublda.test.js",
-    "hm": "node ublda.js store input.txt --block-size 8192 --storage ./data --compress --verbose"
+    "example": "node example.js"
   },
   "keywords": [
     "deduplication",
