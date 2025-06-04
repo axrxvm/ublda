@@ -128,3 +128,9 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# UBLDA cache
+data/
+output_fs.txt
+output_ublda.txt
+input.txt
