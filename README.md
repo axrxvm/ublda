@@ -56,14 +56,12 @@ npm install ublda
 
 ### From Source (for development or specific versions):
 ```bash
-git clone https://github.com/your-username/ublda.git # Replace with actual repo URL if available
+git clone https://github.com/axrxvm/ublda.git # Replace with actual repo URL if available
 cd ublda
 npm install # Install dependencies
 npm link    # To make 'ublda' command available globally from this source
 # Or run directly: node bin/cli.js --help
 ```
-*(Note: Update the clone URL if the project is hosted on a platform like GitHub.)*
-
 ## Basic CLI Usage
 
 Here are a few examples of how to use the UBLDA CLI:
