@@ -16,7 +16,7 @@ const COMPRESSION_ALGORITHMS = {
 };
 
 /**
- * Splits a file into blocks.
+ * Splits a file into blocks using streams.
  * @param {string} filePath
  * @param {number} blockSize
  * @returns {Promise<Buffer[]>}
@@ -30,21 +30,26 @@ export async function splitFile(filePath, blockSize) {
 
   if (blockSize <= 0) throw new Error('Block size must be positive');
 
-  const fh = await open(filePath, 'r');
-  const { size } = await fh.stat();
-  const blocks = [];
-  let offset = 0;
+  return new Promise((resolve, reject) => {
+    const blocks = [];
+    let currentBlock = Buffer.alloc(0);
+    const stream = fs.createReadStream(filePath, { highWaterMark: blockSize });
 
-  while (offset < size) {
-    const len = Math.min(blockSize, size - offset);
-    const buffer = Buffer.alloc(len);
-    await fh.read(buffer, 0, len, offset);
-    blocks.push(buffer);
-    offset += len;
-  }
+    stream.on('data', (chunk) => {
+      currentBlock = Buffer.concat([currentBlock, chunk]);
+      while (currentBlock.length >= blockSize) {
+        blocks.push(currentBlock.slice(0, blockSize));
+        currentBlock = currentBlock.slice(blockSize);
+      }
+    });
 
-  await fh.close();
-  return blocks;
+    stream.on('end', () => {
+      if (currentBlock.length > 0) blocks.push(currentBlock);
+      resolve(blocks);
+    });
+
+    stream.on('error', (err) => reject(err));
+  });
 }
 
 /**
@@ -56,11 +61,18 @@ export async function writeFileFromBlocks(outputPath, blocks) {
   if (!outputPath) throw new Error('Output path is required');
   if (!Array.isArray(blocks) || blocks.some(b => !(b instanceof Buffer))) throw new Error('Blocks must be an array of Buffers');
 
-  const fh = await fs.open(outputPath, 'w');
-  for (const block of blocks) {
-    await fh.write(block);
-  }
-  await fh.close();
+  const outputStream = fs.createWriteStream(outputPath);
+  return new Promise((resolve, reject) => {
+    outputStream.on('finish', resolve);
+    outputStream.on('error', reject);
+
+    for (const block of blocks) {
+      if (!outputStream.write(block)) {
+        outputStream.once('drain', () => {});
+      }
+    }
+    outputStream.end();
+  });
 }
 
 /**

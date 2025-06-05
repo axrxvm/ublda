@@ -1,4 +1,4 @@
-import { readFile, writeFile, storeFile, restoreFile } from 'ublda';
+import { readFile, writeFile, storeFile, restoreFile } from './src/index.js';
 import fs from 'fs-extra';
 import path from 'path';
 

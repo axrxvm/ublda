@@ -14,7 +14,7 @@ export async function saveManifest(manifestDir, filename, { hashes, metadata }) 
   if (!metadata || typeof metadata !== 'object') throw new Error('Metadata must be an object');
 
   const outPath = path.join(manifestDir, `${filename}.manifest.json`);
-  await fs.writeJson(outPath, { hashes, metadata }, { spaces: 2 });
+  await fs.writeJson(outPath, { hashes, metadata }); // Removed spaces for compact JSON
   return outPath;
 }
 
@@ -25,7 +25,7 @@ export async function saveManifest(manifestDir, filename, { hashes, metadata }) 
  */
 export async function loadManifest(manifestPath) {
   if (!manifestPath.endsWith('.json')) throw new Error('Manifest must be a .json file');
-  const exists = await new Promise(resolve => fs.access(manifestPath, err => resolve(!err)));
+  const exists = await fs.access(manifestPath).then(() => true).catch(() => false);
   if (!exists) throw new Error(`Manifest not found: ${manifestPath}`);
   const data = await fs.readJson(manifestPath);
   if (!data.hashes || !data.metadata) throw new Error('Invalid manifest format');

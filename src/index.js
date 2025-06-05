@@ -7,12 +7,15 @@ import { splitFile, writeFileFromBlocks, createReadStreamFromBlocks } from './fi
 import { hashBuffer } from './hasher.js';
 import { writeBlock, readBlock } from './storage.js';
 import { saveManifest, loadManifest } from './manifest.js';
+import os from 'os';
+
+// Dynamic concurrency based on CPU cores
+const limit = pLimit(Math.max(2, os.cpus().length));
 
 const deflateAsync = promisify(zlib.deflate);
 const inflateAsync = promisify(zlib.inflate);
 const brotliCompressAsync = promisify(zlib.brotliCompress);
 const brotliDecompressAsync = promisify(zlib.brotliDecompress);
-const limit = pLimit(20); // Increased concurrency for maximum performance
 
 const COMPRESSION_ALGORITHMS = {
   DEFLATE: 'deflate',
@@ -20,15 +23,17 @@ const COMPRESSION_ALGORITHMS = {
   NONE: 'none',
 };
 
-// Helper function to estimate data entropy for compression decision
+// Optimized entropy estimation with sampling
 function estimateEntropy(buffer) {
   if (buffer.length === 0) return 0;
+  const sampleSize = Math.min(1024, buffer.length);
+  const sample = buffer.slice(0, sampleSize);
   const byteCounts = new Uint8Array(256);
-  for (const byte of buffer) byteCounts[byte]++;
+  for (const byte of sample) byteCounts[byte]++;
   let entropy = 0;
   for (const count of byteCounts) {
     if (count > 0) {
-      const p = count / buffer.length;
+      const p = count / sampleSize;
       entropy -= p * Math.log2(p);
     }
   }
@@ -51,12 +56,7 @@ async function validateCompressedBlock(block, algorithm) {
 
 // Helper function to check file/directory existence
 async function pathExists(path) {
-  try {
-    await fs.access(path);
-    return true;
-  } catch {
-    return false;
-  }
+  return fs.access(path).then(() => true).catch(() => false);
 }
 
 /**
@@ -92,7 +92,7 @@ export async function storeFile(filePath, {
       createdAt: new Date().toISOString()
     };
     const manifestPath = path.join(manifestDir, `${fileName}.manifest.json`);
-    await fs.writeJson(manifestPath, { hashes: [], blockCompression: [], metadata }, { spaces: 2 });
+    await fs.writeJson(manifestPath, { hashes: [], blockCompression: [], metadata });
     return { manifestPath, blockCount: 0 };
   }
 
@@ -127,7 +127,7 @@ export async function storeFile(filePath, {
             try {
               if (actualCompression === COMPRESSION_ALGORITHMS.BROTLI) {
                 processedBlock = await limit(() => brotliCompressAsync(chunk, {
-                  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } // Faster compression
+                  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 } // Faster compression
                 }));
               } else {
                 processedBlock = await limit(() => deflateAsync(chunk));
@@ -147,7 +147,7 @@ export async function storeFile(filePath, {
         }
 
         const hash = hashBuffer(processedBlock);
-        await limit(() => writeBlock(blockDir, hash, processedBlock));
+        await limit(() => writeBlock(blockDir, hash, processedBlock, { verbose }));
         hashes.push(hash);
         blockCompression.push(actualCompression);
         stream.resume();
@@ -160,7 +160,7 @@ export async function storeFile(filePath, {
     stream.on('end', async () => {
       try {
         const manifestPath = path.join(manifestDir, `${fileName}.manifest.json`);
-        await fs.writeJson(manifestPath, { hashes, blockCompression, metadata }, { spaces: 2 });
+        await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
         resolve({ manifestPath, blockCount: hashes.length });
       } catch (err) {
         stream.destroy();
@@ -266,22 +266,154 @@ export async function readFile(manifestPath, {
     });
   }
 
-  const blocks = [];
-  for (let i = 0; i < hashes.length; i++) {
-    const hash = hashes[i];
+  const blocks = await Promise.all(hashes.map(async (hash, i) => {
     const compression = blockCompression[i];
     const block = await limit(() => readBlock(blockDir, hash));
-
-    let decompressedBlock = block;
-    if (compression !== COMPRESSION_ALGORITHMS.NONE) {
-      decompressedBlock = compression === COMPRESSION_ALGORITHMS.BROTLI
+    return compression !== COMPRESSION_ALGORITHMS.NONE
+      ? compression === COMPRESSION_ALGORITHMS.BROTLI
         ? await limit(() => brotliDecompressAsync(block))
-        : await limit(() => inflateAsync(block));
-    }
-    blocks.push(decompressedBlock);
-  }
+        : await limit(() => inflateAsync(block))
+      : block;
+  }));
 
   return Buffer.concat(blocks);
+}
+
+/**
+ * Verifies a restored file against its manifest.
+ * @param {string} filePath
+ * @param {string} manifestPath
+ * @param {object} [options]
+ * @returns {Promise<boolean>}
+ */
+export async function verifyFile(filePath, manifestPath, {
+  storageDir = './storage',
+  verbose = false,
+} = {}) {
+  if (!(await pathExists(filePath))) throw new Error(`File not found: ${filePath}`);
+  if (!(await pathExists(manifestPath))) throw new Error(`Manifest file not found: ${manifestPath}`);
+
+  const { hashes: manifestHashes, blockCompression, metadata } = await loadManifest(manifestPath);
+  if (!metadata.blockSize) throw new Error('Manifest missing blockSize metadata');
+  if (!Array.isArray(manifestHashes) || manifestHashes.length === 0 && metadata.originalSize > 0) {
+    throw new Error('Manifest contains no hashes for a non-empty file.');
+  }
+  if (metadata.originalSize === 0 && manifestHashes.length > 0) {
+    throw new Error('Manifest contains hashes for an empty file.');
+  }
+  if (metadata.originalSize === 0 && manifestHashes.length === 0) {
+    const actualFileStat = await fs.stat(filePath);
+    if (actualFileStat.size !== 0) {
+      throw new Error(`Manifest indicates empty file, but file on disk has size ${actualFileStat.size}.`);
+    }
+    if (verbose) console.log('File and manifest correctly represent an empty file.');
+    return true;
+  }
+
+  const blockDir = path.join(storageDir, 'blocks');
+
+  return new Promise((resolve, reject) => {
+    const fileStream = fs.createReadStream(filePath, { highWaterMark: metadata.blockSize });
+    let currentFileBlockBuffer = Buffer.alloc(0);
+    let manifestHashIndex = 0;
+    let totalBytesReadFromFile = 0;
+
+    const processBlock = async (fileBlockChunk, isLastBlock = false) => {
+      try {
+        if (manifestHashIndex >= manifestHashes.length) {
+          fileStream.destroy();
+          reject(new Error('File contains more blocks than specified in the manifest.'));
+          return false;
+        }
+
+        let blockToHash = fileBlockChunk;
+        const compression = blockCompression[manifestHashIndex];
+        if (compression !== COMPRESSION_ALGORITHMS.NONE) {
+          blockToHash = compression === COMPRESSION_ALGORITHMS.BROTLI
+            ? await limit(() => brotliCompressAsync(fileBlockChunk, {
+                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 }
+              }))
+            : await limit(() => deflateAsync(fileBlockChunk));
+        }
+
+        const computedFileBlockHash = hashBuffer(blockToHash);
+        const expectedManifestHash = manifestHashes[manifestHashIndex];
+
+        if (computedFileBlockHash !== expectedManifestHash) {
+          fileStream.destroy();
+          reject(new Error(`Hash mismatch for file block ${manifestHashIndex + 1}: expected ${expectedManifestHash}, got ${computedFileBlockHash}`));
+          return false;
+        }
+
+        const storedBlock = await limit(() => readBlock(blockDir, expectedManifestHash));
+        const storedBlockHash = hashBuffer(storedBlock);
+        if (storedBlockHash !== expectedManifestHash) {
+          fileStream.destroy();
+          reject(new Error(`Stored block ${manifestHashIndex + 1} is corrupted or does not match manifest: expected ${expectedManifestHash}, got ${storedBlockHash}`));
+          return false;
+        }
+
+        if (verbose) console.log(`Verified block ${manifestHashIndex + 1}/${manifestHashes.length} (hash: ${expectedManifestHash})`);
+        manifestHashIndex++;
+        return true;
+      } catch (err) {
+        fileStream.destroy();
+        reject(err);
+        return false;
+      }
+    };
+
+    fileStream.on('data', async (chunk) => {
+      totalBytesReadFromFile += chunk.length;
+      currentFileBlockBuffer = Buffer.concat([currentFileBlockBuffer, chunk]);
+
+      while (currentFileBlockBuffer.length >= metadata.blockSize) {
+        if (manifestHashIndex >= manifestHashes.length && currentFileBlockBuffer.length > 0) {
+          fileStream.destroy();
+          reject(new Error('File contains more data than specified by manifest hashes after processing full blocks.'));
+          return;
+        }
+        const blockToProcess = currentFileBlockBuffer.slice(0, metadata.blockSize);
+        currentFileBlockBuffer = currentFileBlockBuffer.slice(metadata.blockSize);
+
+        fileStream.pause();
+        const success = await processBlock(blockToProcess);
+        if (!success) return;
+        fileStream.resume();
+      }
+    });
+
+    fileStream.on('end', async () => {
+      try {
+        if (currentFileBlockBuffer.length > 0) {
+          if (manifestHashIndex >= manifestHashes.length) {
+            reject(new Error('File has trailing data not accounted for in manifest.'));
+            return;
+          }
+          const success = await processBlock(currentFileBlockBuffer, true);
+          if (!success) return;
+        }
+
+        if (totalBytesReadFromFile !== metadata.originalSize) {
+          reject(new Error(`File size mismatch: manifest indicates ${metadata.originalSize} bytes, but read ${totalBytesReadFromFile} bytes from file.`));
+          return;
+        }
+
+        if (manifestHashIndex !== manifestHashes.length) {
+          reject(new Error(`Block count mismatch: manifest indicates ${manifestHashes.length} blocks, but only processed ${manifestHashIndex} blocks from file.`));
+          return;
+        }
+
+        resolve(true);
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    fileStream.on('error', (err) => {
+      reject(err);
+    });
+  });
 }
 
 /**
@@ -315,7 +447,7 @@ export async function writeFile(filename, buffer, {
       createdAt: new Date().toISOString()
     };
     const manifestPath = path.join(manifestsDir, `${filename}.manifest.json`);
-    await fs.writeJson(manifestPath, { hashes: [], blockCompression: [], metadata }, { spaces: 2 });
+    await fs.writeJson(manifestPath, { hashes: [], blockCompression: [], metadata });
     return { manifestPath, blockCount: 0, totalSize: 0 };
   }
 
@@ -330,43 +462,51 @@ export async function writeFile(filename, buffer, {
     createdAt: new Date().toISOString()
   };
 
+  const blockPromises = [];
   for (let offset = 0; offset < buffer.length; offset += blockSize) {
     const chunk = buffer.slice(offset, offset + blockSize);
-    let blockToStore = chunk;
-    let actualCompression = COMPRESSION_ALGORITHMS.NONE;
+    blockPromises.push(limit(async () => {
+      let blockToStore = chunk;
+      let actualCompression = COMPRESSION_ALGORITHMS.NONE;
 
-    if (compress && chunk.length >= 100) {
-      const entropy = estimateEntropy(chunk);
-      if (entropy < 6.0) {
-        actualCompression = metadata.compressionAlgorithm;
-        try {
-          blockToStore = actualCompression === COMPRESSION_ALGORITHMS.BROTLI
-            ? await limit(() => brotliCompressAsync(chunk, {
-                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 }
-              }))
-            : await limit(() => deflateAsync(chunk));
-          if (!(await validateCompressedBlock(blockToStore, actualCompression))) {
-            blockToStore = chunk;
-            actualCompression = COMPRESSION_ALGORITHMS.NONE;
-          } else if (blockToStore.length >= chunk.length) {
+      if (compress && chunk.length >= 100) {
+        const entropy = estimateEntropy(chunk);
+        if (entropy < 6.0) {
+          actualCompression = metadata.compressionAlgorithm;
+          try {
+            blockToStore = actualCompression === COMPRESSION_ALGORITHMS.BROTLI
+              ? await brotliCompressAsync(chunk, {
+                  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 }
+                })
+              : await deflateAsync(chunk);
+            if (!(await validateCompressedBlock(blockToStore, actualCompression))) {
+              blockToStore = chunk;
+              actualCompression = COMPRESSION_ALGORITHMS.NONE;
+            } else if (blockToStore.length >= chunk.length) {
+              blockToStore = chunk;
+              actualCompression = COMPRESSION_ALGORITHMS.NONE;
+            }
+          } catch {
             blockToStore = chunk;
             actualCompression = COMPRESSION_ALGORITHMS.NONE;
           }
-        } catch {
-          blockToStore = chunk;
-          actualCompression = COMPRESSION_ALGORITHMS.NONE;
         }
       }
-    }
 
-    const hash = hashBuffer(blockToStore);
-    await limit(() => writeBlock(blocksDir, hash, blockToStore));
-    hashes.push(hash);
-    blockCompression.push(actualCompression);
+      const hash = hashBuffer(blockToStore);
+      await writeBlock(blocksDir, hash, blockToStore, { verbose });
+      return { hash, compression: actualCompression };
+    }));
   }
 
+  const results = await Promise.all(blockPromises);
+  results.forEach(({ hash, compression }) => {
+    hashes.push(hash);
+    blockCompression.push(compression);
+  });
+
   const manifestPath = path.join(manifestsDir, `${filename}.manifest.json`);
-  await fs.writeJson(manifestPath, { hashes, blockCompression, metadata }, { spaces: 2 });
+  await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
 
   return { manifestPath, blockCount: hashes.length, totalSize: buffer.length };
 }
