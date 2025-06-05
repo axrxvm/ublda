@@ -22,33 +22,15 @@ const COMPRESSION_ALGORITHMS = {
  * @returns {Promise<Buffer[]>}
  */
 export async function splitFile(filePath, blockSize) {
-  try {
-    await access(filePath, constants.F_OK);
-  } catch {
-    throw new Error(`File not found: ${filePath}`);
-  }
-
+  await access(filePath, constants.F_OK).catch(() => { throw new Error(`File not found: ${filePath}`); });
   if (blockSize <= 0) throw new Error('Block size must be positive');
 
   return new Promise((resolve, reject) => {
     const blocks = [];
-    let currentBlock = Buffer.alloc(0);
     const stream = fs.createReadStream(filePath, { highWaterMark: blockSize });
 
-    stream.on('data', (chunk) => {
-      if (currentBlock.length + chunk.length <= blockSize) {
-        currentBlock = Buffer.concat([currentBlock, chunk]);
-      } else {
-        blocks.push(currentBlock);
-        currentBlock = chunk;
-      }
-    });
-
-    stream.on('end', () => {
-      if (currentBlock.length > 0) blocks.push(currentBlock);
-      resolve(blocks);
-    });
-
+    stream.on('data', (chunk) => blocks.push(chunk));
+    stream.on('end', () => resolve(blocks));
     stream.on('error', (err) => reject(err));
   });
 }
@@ -66,12 +48,7 @@ export async function writeFileFromBlocks(outputPath, blocks) {
   return new Promise((resolve, reject) => {
     outputStream.on('finish', resolve);
     outputStream.on('error', reject);
-
-    for (const block of blocks) {
-      if (!outputStream.write(block)) {
-        outputStream.once('drain', () => {});
-      }
-    }
+    blocks.forEach(block => outputStream.write(block));
     outputStream.end();
   });
 }
@@ -98,19 +75,16 @@ export function createReadStreamFromBlocks(blockDir, hashes, {
         return;
       }
 
+      const hash = hashes[index];
+      const compression = blockCompression[index] || (compress ? compressionAlgorithm : COMPRESSION_ALGORITHMS.NONE);
       try {
-        const hash = hashes[index];
-        const compression = blockCompression[index] || (compress ? compressionAlgorithm : COMPRESSION_ALGORITHMS.NONE);
         const rawBlock = await readBlock(blockDir, hash);
-
-        let dataToPush = rawBlock;
-        if (compression !== COMPRESSION_ALGORITHMS.NONE) {
-          dataToPush = compression === COMPRESSION_ALGORITHMS.BROTLI
+        const data = compression === COMPRESSION_ALGORITHMS.NONE
+          ? rawBlock
+          : compression === COMPRESSION_ALGORITHMS.BROTLI
             ? await brotliDecompressAsync(rawBlock)
             : await inflateAsync(rawBlock);
-        }
-
-        this.push(dataToPush);
+        this.push(data);
         index++;
       } catch (error) {
         this.emit('error', new Error(`Failed to stream block ${index + 1}: ${error.message}`));

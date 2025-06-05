@@ -1,9 +1,8 @@
 import crypto from 'crypto';
 
-// Lightweight hash set for deduplication (max 10,000 entries)
-const hashSet = {};
-const hashQueue = [];
-const MAX_HASHES = 10000;
+// Lightweight array-based hash cache (max 2000 entries)
+const hashCache = [];
+const MAX_HASHES = 2000;
 
 /**
  * Returns SHA-256 hash of a buffer.
@@ -12,16 +11,15 @@ const MAX_HASHES = 10000;
  */
 export function hashBuffer(buffer) {
   if (!(buffer instanceof Buffer)) throw new Error('Input must be a Buffer');
-  const dataStr = buffer.toString('hex');
-  if (hashSet[dataStr]) {
-    return hashSet[dataStr];
+  const sample = buffer.slice(0, Math.min(16, buffer.length)).toString('hex');
+  const existing = hashCache.find(entry => entry.sample === sample);
+  if (existing) {
+    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+    if (hash === existing.hash) return hash;
   }
+
   const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-  hashSet[dataStr] = hash;
-  hashQueue.push(dataStr);
-  if (hashQueue.length > MAX_HASHES) {
-    const oldKey = hashQueue.shift();
-    delete hashSet[oldKey];
-  }
+  hashCache.push({ sample, hash });
+  if (hashCache.length > MAX_HASHES) hashCache.shift();
   return hash;
 }

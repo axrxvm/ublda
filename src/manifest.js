@@ -25,8 +25,9 @@ export async function saveManifest(manifestDir, filename, { hashes, metadata }) 
  */
 export async function loadManifest(manifestPath) {
   if (!manifestPath.endsWith('.json')) throw new Error('Manifest must be a .json file');
-  const exists = await fs.access(manifestPath).then(() => true).catch(() => false);
-  if (!exists) throw new Error(`Manifest not found: ${manifestPath}`);
+  if (!(await fs.access(manifestPath).then(() => true).catch(() => false))) {
+    throw new Error(`Manifest not found: ${manifestPath}`);
+  }
   const data = await fs.readJson(manifestPath);
   if (!data.hashes || !data.metadata) throw new Error('Invalid manifest format');
   return data;

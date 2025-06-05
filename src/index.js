@@ -1,17 +1,16 @@
 import path from 'path';
 import fs from 'fs-extra';
 import zlib from 'zlib';
+import { pipeline } from 'stream/promises';
 import { promisify } from 'util';
 import pLimit from 'p-limit';
 import { splitFile, writeFileFromBlocks, createReadStreamFromBlocks } from './file.js';
 import { hashBuffer } from './hasher.js';
-import { writeBlock, readBlock } from './storage.js';
+import { writeBlocksBatch, readBlock } from './storage.js';
 import { saveManifest, loadManifest } from './manifest.js';
 import os from 'os';
 
-// Dynamic concurrency based on CPU cores
-const limit = pLimit(Math.max(2, os.cpus().length));
-
+const limit = pLimit(Math.max(4, os.cpus().length)); // Balanced concurrency
 const deflateAsync = promisify(zlib.deflate);
 const inflateAsync = promisify(zlib.inflate);
 const brotliCompressAsync = promisify(zlib.brotliCompress);
@@ -23,40 +22,11 @@ const COMPRESSION_ALGORITHMS = {
   NONE: 'none',
 };
 
-// Optimized entropy estimation with sampling
-function estimateEntropy(buffer) {
-  if (buffer.length < 100) return 8; // Skip for small buffers
-  const sampleSize = Math.min(1024, buffer.length);
-  const sample = buffer.slice(0, sampleSize);
-  const byteCounts = new Uint8Array(256);
-  for (const byte of sample) byteCounts[byte]++;
-  let entropy = 0;
-  for (const count of byteCounts) {
-    if (count > 0) {
-      const p = count / sampleSize;
-      entropy -= p * Math.log2(p);
-    }
-  }
-  return entropy;
-}
-
-// Helper function to validate compressed data
-async function validateCompressedBlock(block, algorithm) {
-  try {
-    if (algorithm === COMPRESSION_ALGORITHMS.BROTLI) {
-      await brotliDecompressAsync(block);
-    } else if (algorithm === COMPRESSION_ALGORITHMS.DEFLATE) {
-      await inflateAsync(block);
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Helper function to check file/directory existence
-async function pathExists(path) {
-  return fs.access(path).then(() => true).catch(() => false);
+// Fast heuristic for compression
+function shouldCompress(fileName, buffer) {
+  if (buffer.length < 2048) return false;
+  const ext = path.extname(fileName).toLowerCase();
+  return !['.jpg', '.png', '.mp4', '.zip', '.gz', '.pdf', '.mp3', '.avi'].includes(ext);
 }
 
 /**
@@ -67,19 +37,19 @@ async function pathExists(path) {
  */
 export async function storeFile(filePath, {
   storageDir = './storage',
-  blockSize = 1048576,
+  blockSize = 8 * 1024 * 1024, // 8MB
   compress = true,
   verbose = false,
   compressionAlgorithm = COMPRESSION_ALGORITHMS.BROTLI,
 } = {}) {
-  if (!(await pathExists(filePath))) throw new Error(`File not found: ${filePath}`);
+  if (!(await fs.access(filePath).then(() => true).catch(() => false))) throw new Error(`File not found: ${filePath}`);
   if (blockSize <= 0) throw new Error('Block size must be positive');
 
   const fileName = path.basename(filePath);
   const blockDir = path.join(storageDir, 'blocks');
   const manifestDir = path.join(storageDir, 'manifests');
-  await fs.ensureDir(blockDir);
-  await fs.ensureDir(manifestDir);
+  await fs.mkdir(blockDir, { recursive: true });
+  await fs.mkdir(manifestDir, { recursive: true });
 
   const stats = await fs.stat(filePath);
   if (stats.size === 0) {
@@ -96,6 +66,19 @@ export async function storeFile(filePath, {
     return { manifestPath, blockCount: 0 };
   }
 
+  // Fast path for small files (<8MB)
+  if (stats.size <= blockSize) {
+    const buffer = await fs.readFile(filePath);
+    const { manifestPath, blockCount } = await writeFile(fileName, buffer, {
+      storageDir,
+      blockSize,
+      compress,
+      verbose,
+      compressionAlgorithm
+    });
+    return { manifestPath, blockCount };
+  }
+
   const metadata = {
     originalSize: stats.size,
     blockSize,
@@ -105,75 +88,59 @@ export async function storeFile(filePath, {
     createdAt: new Date().toISOString()
   };
 
-  return new Promise((resolve, reject) => {
-    const stream = fs.createReadStream(filePath, { highWaterMark: blockSize });
-    const hashes = [];
-    const blockCompression = [];
-    const blockWritePromises = [];
-    let blockIndex = 0;
+  const stream = fs.createReadStream(filePath, { highWaterMark: blockSize });
+  const hashes = [];
+  const blockCompression = [];
+  const blocksToWrite = [];
+  let blockIndex = 0;
 
+  return new Promise((resolve, reject) => {
     stream.on('data', async (chunk) => {
       if (chunk.length === 0) return;
 
       stream.pause();
       blockIndex++;
-      blockWritePromises.push(limit(async () => {
-        let processedBlock = chunk;
-        let actualCompression = COMPRESSION_ALGORITHMS.NONE;
+      let processedBlock = chunk;
+      let actualCompression = COMPRESSION_ALGORITHMS.NONE;
 
-        if (compress && chunk.length >= 1024) { // Skip compression for small blocks
-          const entropy = estimateEntropy(chunk);
-          if (entropy < 6.0) {
-            actualCompression = metadata.compressionAlgorithm;
-            try {
-              if (actualCompression === COMPRESSION_ALGORITHMS.BROTLI) {
-                processedBlock = await brotliCompressAsync(chunk, {
-                  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 }
-                });
-              } else {
-                processedBlock = await deflateAsync(chunk);
-              }
-              if (!(await validateCompressedBlock(processedBlock, actualCompression))) {
-                processedBlock = chunk;
-                actualCompression = COMPRESSION_ALGORITHMS.NONE;
-              } else if (processedBlock.length >= chunk.length) {
-                processedBlock = chunk;
-                actualCompression = COMPRESSION_ALGORITHMS.NONE;
-              }
-            } catch {
-              processedBlock = chunk;
-              actualCompression = COMPRESSION_ALGORITHMS.NONE;
-            }
+      if (compress && shouldCompress(fileName, chunk)) {
+        actualCompression = metadata.compressionAlgorithm;
+        try {
+          processedBlock = actualCompression === COMPRESSION_ALGORITHMS.BROTLI
+            ? await limit(() => brotliCompressAsync(chunk, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 } }))
+            : await limit(() => deflateAsync(chunk));
+          if (processedBlock.length >= chunk.length) {
+            processedBlock = chunk;
+            actualCompression = COMPRESSION_ALGORITHMS.NONE;
           }
+        } catch {
+          processedBlock = chunk;
+          actualCompression = COMPRESSION_ALGORITHMS.NONE;
         }
+      }
 
-        const hash = hashBuffer(processedBlock);
-        await writeBlock(blockDir, hash, processedBlock, { verbose });
-        return { hash, compression: actualCompression };
-      }));
+      const hash = hashBuffer(processedBlock);
+      blocksToWrite.push({ hash, data: processedBlock });
+      hashes.push(hash);
+      blockCompression.push(actualCompression);
+
+      if (blocksToWrite.length >= 8) { // Batch writes
+        await limit(() => writeBlocksBatch(blockDir, blocksToWrite.splice(0), { verbose }));
+      }
 
       stream.resume();
     });
 
     stream.on('end', async () => {
-      try {
-        const results = await Promise.all(blockWritePromises);
-        results.forEach(({ hash, compression }) => {
-          hashes.push(hash);
-          blockCompression.push(compression);
-        });
-        const manifestPath = path.join(manifestDir, `${fileName}.manifest.json`);
-        await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
-        resolve({ manifestPath, blockCount: hashes.length });
-      } catch (err) {
-        stream.destroy();
-        reject(new Error(`Failed to save manifest: ${err.message}`));
+      if (blocksToWrite.length > 0) {
+        await limit(() => writeBlocksBatch(blockDir, blocksToWrite, { verbose }));
       }
+      const manifestPath = path.join(manifestDir, `${fileName}.manifest.json`);
+      await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
+      resolve({ manifestPath, blockCount: hashes.length });
     });
 
-    stream.on('error', (err) => {
-      reject(new Error(`Stream error: ${err.message}`));
-    });
+    stream.on('error', (err) => reject(new Error(`Stream error: ${err.message}`)));
   });
 }
 
@@ -188,9 +155,9 @@ export async function restoreFile(manifestPath, outputPath, {
   storageDir = './storage',
   verbose = false,
 } = {}) {
-  if (!(await pathExists(manifestPath))) throw new Error(`Manifest file not found: ${manifestPath}`);
+  if (!(await fs.access(manifestPath).then(() => true).catch(() => false))) throw new Error(`Manifest file not found: ${manifestPath}`);
   const blockDir = path.join(storageDir, 'blocks');
-  if (!(await pathExists(blockDir))) throw new Error(`Block directory not found: ${blockDir}`);
+  if (!(await fs.access(blockDir).then(() => true).catch(() => false))) throw new Error(`Block directory not found: ${blockDir}`);
 
   const { hashes, blockCompression, metadata } = await loadManifest(manifestPath);
   if (!Array.isArray(hashes) || !Array.isArray(blockCompression) || hashes.length !== blockCompression.length) {
@@ -207,35 +174,10 @@ export async function restoreFile(manifestPath, outputPath, {
   }
 
   const outputStream = fs.createWriteStream(outputPath);
-  return new Promise((resolve, reject) => {
-    outputStream.on('finish', () => resolve());
-    outputStream.on('error', (err) => reject(err));
-
-    (async () => {
-      try {
-        for (let i = 0; i < hashes.length; i++) {
-          const hash = hashes[i];
-          const compression = blockCompression[i];
-          const block = await limit(() => readBlock(blockDir, hash));
-
-          let dataToWrite = block;
-          if (compression !== COMPRESSION_ALGORITHMS.NONE) {
-            dataToWrite = compression === COMPRESSION_ALGORITHMS.BROTLI
-              ? await limit(() => brotliDecompressAsync(block))
-              : await limit(() => inflateAsync(block));
-          }
-
-          if (!outputStream.write(dataToWrite)) {
-            await new Promise(resolve => outputStream.once('drain', resolve));
-          }
-        }
-        outputStream.end();
-      } catch (err) {
-        outputStream.destroy(err);
-        reject(err);
-      }
-    })();
-  });
+  await pipeline(
+    createReadStreamFromBlocks(blockDir, hashes, { blockCompression, verbose, compress: metadata.compress, compressionAlgorithm: metadata.compressionAlgorithm }),
+    outputStream
+  );
 }
 
 /**
@@ -250,10 +192,10 @@ export async function readFile(manifestPath, {
   stream = false,
 } = {}) {
   if (!manifestPath.endsWith('.json')) throw new Error('Manifest path must point to a .json file');
-  if (!(await pathExists(manifestPath))) throw new Error(`Manifest file not found: ${manifestPath}`);
+  if (!(await fs.access(manifestPath).then(() => true).catch(() => false))) throw new Error(`Manifest file not found: ${manifestPath}`);
 
   const blockDir = path.join(storageDir, 'blocks');
-  if (!(await pathExists(blockDir))) throw new Error(`Block directory not found: ${blockDir}`);
+  if (!(await fs.access(blockDir).then(() => true).catch(() => false))) throw new Error(`Block directory not found: ${blockDir}`);
 
   const { hashes, blockCompression, metadata } = await loadManifest(manifestPath);
   if (!Array.isArray(hashes) || !Array.isArray(blockCompression) || hashes.length !== blockCompression.length) {
@@ -269,15 +211,19 @@ export async function readFile(manifestPath, {
     });
   }
 
-  const blockPromises = hashes.map(async (hash, i) => {
+  const blockPromises = hashes.map((hash, i) => limit(async () => {
     const compression = blockCompression[i];
-    const block = await limit(() => readBlock(blockDir, hash));
-    return compression !== COMPRESSION_ALGORITHMS.NONE
-      ? compression === COMPRESSION_ALGORITHMS.BROTLI
-        ? await limit(() => brotliDecompressAsync(block))
-        : await limit(() => inflateAsync(block))
-      : block;
-  });
+    const block = await readBlock(blockDir, hash);
+    try {
+      return compression !== COMPRESSION_ALGORITHMS.NONE
+        ? compression === COMPRESSION_ALGORITHMS.BROTLI
+          ? await brotliDecompressAsync(block)
+          : await inflateAsync(block)
+        : block;
+    } catch (err) {
+      throw new Error(`Decompression failed for block ${i + 1}: ${err.message}`);
+    }
+  }));
 
   return Buffer.concat(await Promise.all(blockPromises));
 }
@@ -293,8 +239,8 @@ export async function verifyFile(filePath, manifestPath, {
   storageDir = './storage',
   verbose = false,
 } = {}) {
-  if (!(await pathExists(filePath))) throw new Error(`File not found: ${filePath}`);
-  if (!(await pathExists(manifestPath))) throw new Error(`Manifest file not found: ${manifestPath}`);
+  if (!(await fs.access(filePath).then(() => true).catch(() => false))) throw new Error(`File not found: ${filePath}`);
+  if (!(await fs.access(manifestPath).then(() => true).catch(() => false))) throw new Error(`Manifest file not found: ${manifestPath}`);
 
   const { hashes: manifestHashes, blockCompression, metadata } = await loadManifest(manifestPath);
   if (!metadata.blockSize) throw new Error('Manifest missing blockSize metadata');
@@ -306,21 +252,18 @@ export async function verifyFile(filePath, manifestPath, {
   }
   if (metadata.originalSize === 0 && manifestHashes.length === 0) {
     const actualFileStat = await fs.stat(filePath);
-    if (actualFileStat.size !== 0) {
-      throw new Error(`Manifest indicates empty file, but file on disk has size ${actualFileStat.size}.`);
-    }
+    if (actualFileStat.size !== 0) throw new Error(`Manifest indicates empty file, but file on disk has size ${actualFileStat.size}.`);
     if (verbose) console.log('File and manifest correctly represent an empty file.');
     return true;
   }
 
   const blockDir = path.join(storageDir, 'blocks');
+  const fileStream = fs.createReadStream(filePath, { highWaterMark: metadata.blockSize });
+  let currentFileBlockBuffer = Buffer.alloc(0);
+  let manifestHashIndex = 0;
+  let totalBytesReadFromFile = 0;
 
   return new Promise((resolve, reject) => {
-    const fileStream = fs.createReadStream(filePath, { highWaterMark: metadata.blockSize });
-    let currentFileBlockBuffer = Buffer.alloc(0);
-    let manifestHashIndex = 0;
-    let totalBytesReadFromFile = 0;
-
     const processBlock = async (fileBlockChunk, isLastBlock = false) => {
       if (manifestHashIndex >= manifestHashes.length) {
         fileStream.destroy();
@@ -328,14 +271,18 @@ export async function verifyFile(filePath, manifestPath, {
         return false;
       }
 
-      let blockToHash = fileBlockChunk;
       const compression = blockCompression[manifestHashIndex];
-      if (compression !== COMPRESSION_ALGORITHMS.NONE) {
-        blockToHash = compression === COMPRESSION_ALGORITHMS.BROTLI
-          ? await limit(() => brotliCompressAsync(fileBlockChunk, {
-              params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 }
-            }))
-          : await limit(() => deflateAsync(fileBlockChunk));
+      let blockToHash = fileBlockChunk;
+      try {
+        if (compression !== COMPRESSION_ALGORITHMS.NONE) {
+          blockToHash = compression === COMPRESSION_ALGORITHMS.BROTLI
+            ? await limit(() => brotliCompressAsync(fileBlockChunk, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 } }))
+            : await limit(() => deflateAsync(fileBlockChunk));
+        }
+      } catch (err) {
+        fileStream.destroy();
+        reject(new Error(`Compression failed for block ${manifestHashIndex + 1}: ${err.message}`));
+        return false;
       }
 
       const computedFileBlockHash = hashBuffer(blockToHash);
@@ -374,8 +321,7 @@ export async function verifyFile(filePath, manifestPath, {
         currentFileBlockBuffer = currentFileBlockBuffer.slice(metadata.blockSize);
 
         fileStream.pause();
-        const success = await processBlock(blockToProcess);
-        if (!success) return;
+        if (!(await processBlock(blockToProcess))) return;
         fileStream.resume();
       }
     });
@@ -387,8 +333,7 @@ export async function verifyFile(filePath, manifestPath, {
             reject(new Error('File has trailing data not accounted for in manifest.'));
             return;
           }
-          const success = await processBlock(currentFileBlockBuffer, true);
-          if (!success) return;
+          if (!(await processBlock(currentFileBlockBuffer, true))) return;
         }
 
         if (totalBytesReadFromFile !== metadata.originalSize) {
@@ -407,9 +352,7 @@ export async function verifyFile(filePath, manifestPath, {
       }
     });
 
-    fileStream.on('error', (err) => {
-      reject(err);
-    });
+    fileStream.on('error', (err) => reject(err));
   });
 }
 
@@ -422,17 +365,18 @@ export async function verifyFile(filePath, manifestPath, {
  */
 export async function writeFile(filename, buffer, {
   storageDir = './storage',
-  blockSize = 1048576,
+  blockSize = 8 * 1024 * 1024, // 8MB
   compress = true,
   verbose = false,
+  compressionAlgorithm = COMPRESSION_ALGORITHMS.BROTLI,
 } = {}) {
   if (!filename) throw new Error('Filename is required');
   if (!(buffer instanceof Buffer)) throw new Error('Input must be a Buffer');
 
   const blocksDir = path.join(storageDir, 'blocks');
   const manifestsDir = path.join(storageDir, 'manifests');
-  await fs.ensureDir(blocksDir);
-  await fs.ensureDir(manifestsDir);
+  await fs.mkdir(blocksDir, { recursive: true });
+  await fs.mkdir(manifestsDir, { recursive: true });
 
   if (buffer.length === 0) {
     const metadata = {
@@ -448,59 +392,88 @@ export async function writeFile(filename, buffer, {
     return { manifestPath, blockCount: 0, totalSize: 0 };
   }
 
+  // Fast path for small buffers (<8MB)
+  if (buffer.length <= blockSize) {
+    let processedBlock = buffer;
+    let actualCompression = COMPRESSION_ALGORITHMS.NONE;
+
+    if (compress && shouldCompress(filename, buffer)) {
+      actualCompression = compressionAlgorithm;
+      try {
+        processedBlock = actualCompression === COMPRESSION_ALGORITHMS.BROTLI
+          ? await brotliCompressAsync(buffer, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 } })
+          : await deflateAsync(buffer);
+        if (processedBlock.length >= buffer.length) {
+          processedBlock = buffer;
+          actualCompression = COMPRESSION_ALGORITHMS.NONE;
+        }
+      } catch (err) {
+        processedBlock = buffer;
+        actualCompression = COMPRESSION_ALGORITHMS.NONE;
+      }
+    }
+
+    const hash = hashBuffer(processedBlock);
+    await writeBlocksBatch(blocksDir, [{ hash, data: processedBlock }], { verbose });
+    const metadata = {
+      originalSize: buffer.length,
+      blockSize: buffer.length,
+      compress,
+      compressionAlgorithm: actualCompression,
+      originalName: filename,
+      createdAt: new Date().toISOString()
+    };
+    const manifestPath = path.join(manifestsDir, `${filename}.manifest.json`);
+    await fs.writeJson(manifestPath, { hashes: [hash], blockCompression: [actualCompression], metadata });
+    return { manifestPath, blockCount: 1, totalSize: buffer.length };
+  }
+
   const hashes = [];
   const blockCompression = [];
   const metadata = {
     originalSize: buffer.length,
     blockSize,
     compress,
-    compressionAlgorithm: compress ? COMPRESSION_ALGORITHMS.BROTLI : COMPRESSION_ALGORITHMS.NONE,
+    compressionAlgorithm: compress ? compressionAlgorithm : COMPRESSION_ALGORITHMS.NONE,
     originalName: filename,
     createdAt: new Date().toISOString()
   };
+  const blocksToWrite = [];
 
-  const blockPromises = [];
   for (let offset = 0; offset < buffer.length; offset += blockSize) {
     const chunk = buffer.slice(offset, offset + blockSize);
-    blockPromises.push(limit(async () => {
-      let blockToStore = chunk;
-      let actualCompression = COMPRESSION_ALGORITHMS.NONE;
+    let blockToStore = chunk;
+    let actualCompression = COMPRESSION_ALGORITHMS.NONE;
 
-      if (compress && chunk.length >= 1024) { // Skip compression for small blocks
-        const entropy = estimateEntropy(chunk);
-        if (entropy < 6.0) {
-          actualCompression = metadata.compressionAlgorithm;
-          try {
-            blockToStore = actualCompression === COMPRESSION_ALGORITHMS.BROTLI
-              ? await brotliCompressAsync(chunk, {
-                  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 }
-                })
-              : await deflateAsync(chunk);
-            if (!(await validateCompressedBlock(blockToStore, actualCompression))) {
-              blockToStore = chunk;
-              actualCompression = COMPRESSION_ALGORITHMS.NONE;
-            } else if (blockToStore.length >= chunk.length) {
-              blockToStore = chunk;
-              actualCompression = COMPRESSION_ALGORITHMS.NONE;
-            }
-          } catch {
-            blockToStore = chunk;
-            actualCompression = COMPRESSION_ALGORITHMS.NONE;
-          }
+    if (compress && shouldCompress(filename, chunk)) {
+      actualCompression = metadata.compressionAlgorithm;
+      try {
+        blockToStore = actualCompression === COMPRESSION_ALGORITHMS.BROTLI
+          ? await limit(() => brotliCompressAsync(chunk, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 } }))
+          : await limit(() => deflateAsync(chunk));
+        if (blockToStore.length >= chunk.length) {
+          blockToStore = chunk;
+          actualCompression = COMPRESSION_ALGORITHMS.NONE;
         }
+      } catch (err) {
+        blockToStore = chunk;
+        actualCompression = COMPRESSION_ALGORITHMS.NONE;
       }
+    }
 
-      const hash = hashBuffer(blockToStore);
-      await writeBlock(blocksDir, hash, blockToStore, { verbose });
-      return { hash, compression: actualCompression };
-    }));
+    const hash = hashBuffer(blockToStore);
+    blocksToWrite.push({ hash, data: blockToStore });
+    hashes.push(hash);
+    blockCompression.push(actualCompression);
+
+    if (blocksToWrite.length >= 8) {
+      await limit(() => writeBlocksBatch(blocksDir, blocksToWrite.splice(0), { verbose }));
+    }
   }
 
-  const results = await Promise.all(blockPromises);
-  results.forEach(({ hash, compression }) => {
-    hashes.push(hash);
-    blockCompression.push(compression);
-  });
+  if (blocksToWrite.length > 0) {
+    await limit(() => writeBlocksBatch(blocksDir, blocksToWrite, { verbose }));
+  }
 
   const manifestPath = path.join(manifestsDir, `${filename}.manifest.json`);
   await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
