@@ -1,12 +1,11 @@
 import path from 'path';
 import fs from 'fs-extra';
-import { LRUCache } from 'lru-cache';
 
-// Initialize LRU cache for frequently accessed blocks (10MB max)
-const blockCache = new LRUCache({
-  maxSize: 10 * 1024 * 1024, // 10MB
-  sizeCalculation: (value) => value.length,
-});
+// Lightweight FIFO cache for blocks (max 10MB)
+const blockCache = new Map();
+const blockQueue = [];
+const MAX_CACHE_SIZE = 10 * 1024 * 1024; // 10MB
+let currentCacheSize = 0;
 
 /**
  * Writes block if it doesn't exist.
@@ -24,7 +23,20 @@ export async function writeBlock(blockDir, hash, data, { verbose = false } = {})
   const exists = await fs.access(filePath).then(() => true).catch(() => false);
   if (!exists) {
     await fs.writeFile(filePath, data);
-    blockCache.set(hash, data); // Cache the block
+    blockCache.set(hash, data);
+    blockQueue.push(hash);
+    currentCacheSize += data.length;
+
+    // Evict oldest entries if cache exceeds size limit
+    while (currentCacheSize > MAX_CACHE_SIZE && blockQueue.length > 0) {
+      const oldHash = blockQueue.shift();
+      const oldData = blockCache.get(oldHash);
+      if (oldData) {
+        currentCacheSize -= oldData.length;
+        blockCache.delete(oldHash);
+      }
+    }
+
     if (verbose) console.log(`Block written: ${filePath}`);
   }
 }
@@ -37,8 +49,7 @@ export async function writeBlock(blockDir, hash, data, { verbose = false } = {})
  */
 export async function readBlock(blockDir, hash) {
   if (!hash || !/^[0-9a-f]{64}$/i.test(hash)) throw new Error('Invalid hash');
-  
-  // Check cache first
+
   const cachedBlock = blockCache.get(hash);
   if (cachedBlock) return cachedBlock;
 
@@ -46,6 +57,19 @@ export async function readBlock(blockDir, hash) {
   const exists = await fs.access(filePath).then(() => true).catch(() => false);
   if (!exists) throw new Error(`Block not found: ${filePath}`);
   const data = await fs.readFile(filePath);
-  blockCache.set(hash, data); // Cache the block
+  blockCache.set(hash, data);
+  blockQueue.push(hash);
+  currentCacheSize += data.length;
+
+  // Evict oldest entries if cache exceeds size limit
+  while (currentCacheSize > MAX_CACHE_SIZE && blockQueue.length > 0) {
+    const oldHash = blockQueue.shift();
+    const oldData = blockCache.get(oldHash);
+    if (oldData) {
+      currentCacheSize -= oldData.length;
+      blockCache.delete(oldHash);
+    }
+  }
+
   return data;
 }

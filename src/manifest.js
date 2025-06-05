@@ -14,7 +14,7 @@ export async function saveManifest(manifestDir, filename, { hashes, metadata }) 
   if (!metadata || typeof metadata !== 'object') throw new Error('Metadata must be an object');
 
   const outPath = path.join(manifestDir, `${filename}.manifest.json`);
-  await fs.writeJson(outPath, { hashes, metadata }); // Removed spaces for compact JSON
+  await fs.writeJson(outPath, { hashes, metadata });
   return outPath;
 }
 

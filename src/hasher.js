@@ -1,8 +1,9 @@
 import crypto from 'crypto';
-import { BloomFilter } from 'bloomfilter';
 
-// Initialize a Bloom filter for deduplication (1M items, 0.01% false positive rate)
-const bloom = new BloomFilter(1000000, 10);
+// Lightweight hash set for deduplication (max 10,000 entries)
+const hashSet = {};
+const hashQueue = [];
+const MAX_HASHES = 10000;
 
 /**
  * Returns SHA-256 hash of a buffer.
@@ -12,12 +13,15 @@ const bloom = new BloomFilter(1000000, 10);
 export function hashBuffer(buffer) {
   if (!(buffer instanceof Buffer)) throw new Error('Input must be a Buffer');
   const dataStr = buffer.toString('hex');
-  if (bloom.test(dataStr)) {
-    // Check if hash likely exists to avoid redundant computation
-    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-    return hash;
+  if (hashSet[dataStr]) {
+    return hashSet[dataStr];
   }
   const hash = crypto.createHash('sha256').update(buffer).digest('hex');
-  bloom.add(dataStr);
+  hashSet[dataStr] = hash;
+  hashQueue.push(dataStr);
+  if (hashQueue.length > MAX_HASHES) {
+    const oldKey = hashQueue.shift();
+    delete hashSet[oldKey];
+  }
   return hash;
 }

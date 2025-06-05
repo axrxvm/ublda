@@ -1,5 +1,5 @@
 import fs from 'fs/promises';
-import { access, open, constants } from 'fs/promises';
+import { access, constants } from 'fs/promises';
 import { Readable } from 'stream';
 import zlib from 'zlib';
 import { promisify } from 'util';
@@ -36,10 +36,11 @@ export async function splitFile(filePath, blockSize) {
     const stream = fs.createReadStream(filePath, { highWaterMark: blockSize });
 
     stream.on('data', (chunk) => {
-      currentBlock = Buffer.concat([currentBlock, chunk]);
-      while (currentBlock.length >= blockSize) {
-        blocks.push(currentBlock.slice(0, blockSize));
-        currentBlock = currentBlock.slice(blockSize);
+      if (currentBlock.length + chunk.length <= blockSize) {
+        currentBlock = Buffer.concat([currentBlock, chunk]);
+      } else {
+        blocks.push(currentBlock);
+        currentBlock = chunk;
       }
     });
 

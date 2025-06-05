@@ -25,7 +25,7 @@ const COMPRESSION_ALGORITHMS = {
 
 // Optimized entropy estimation with sampling
 function estimateEntropy(buffer) {
-  if (buffer.length === 0) return 0;
+  if (buffer.length < 100) return 8; // Skip for small buffers
   const sampleSize = Math.min(1024, buffer.length);
   const sample = buffer.slice(0, sampleSize);
   const byteCounts = new Uint8Array(256);
@@ -109,6 +109,7 @@ export async function storeFile(filePath, {
     const stream = fs.createReadStream(filePath, { highWaterMark: blockSize });
     const hashes = [];
     const blockCompression = [];
+    const blockWritePromises = [];
     let blockIndex = 0;
 
     stream.on('data', async (chunk) => {
@@ -116,21 +117,21 @@ export async function storeFile(filePath, {
 
       stream.pause();
       blockIndex++;
-      try {
+      blockWritePromises.push(limit(async () => {
         let processedBlock = chunk;
         let actualCompression = COMPRESSION_ALGORITHMS.NONE;
 
-        if (compress && chunk.length >= 100) {
+        if (compress && chunk.length >= 1024) { // Skip compression for small blocks
           const entropy = estimateEntropy(chunk);
           if (entropy < 6.0) {
             actualCompression = metadata.compressionAlgorithm;
             try {
               if (actualCompression === COMPRESSION_ALGORITHMS.BROTLI) {
-                processedBlock = await limit(() => brotliCompressAsync(chunk, {
-                  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 } // Faster compression
-                }));
+                processedBlock = await brotliCompressAsync(chunk, {
+                  params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 }
+                });
               } else {
-                processedBlock = await limit(() => deflateAsync(chunk));
+                processedBlock = await deflateAsync(chunk);
               }
               if (!(await validateCompressedBlock(processedBlock, actualCompression))) {
                 processedBlock = chunk;
@@ -147,18 +148,20 @@ export async function storeFile(filePath, {
         }
 
         const hash = hashBuffer(processedBlock);
-        await limit(() => writeBlock(blockDir, hash, processedBlock, { verbose }));
-        hashes.push(hash);
-        blockCompression.push(actualCompression);
-        stream.resume();
-      } catch (err) {
-        stream.destroy();
-        reject(new Error(`Failed to process block ${blockIndex}: ${err.message}`));
-      }
+        await writeBlock(blockDir, hash, processedBlock, { verbose });
+        return { hash, compression: actualCompression };
+      }));
+
+      stream.resume();
     });
 
     stream.on('end', async () => {
       try {
+        const results = await Promise.all(blockWritePromises);
+        results.forEach(({ hash, compression }) => {
+          hashes.push(hash);
+          blockCompression.push(compression);
+        });
         const manifestPath = path.join(manifestDir, `${fileName}.manifest.json`);
         await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
         resolve({ manifestPath, blockCount: hashes.length });
@@ -266,7 +269,7 @@ export async function readFile(manifestPath, {
     });
   }
 
-  const blocks = await Promise.all(hashes.map(async (hash, i) => {
+  const blockPromises = hashes.map(async (hash, i) => {
     const compression = blockCompression[i];
     const block = await limit(() => readBlock(blockDir, hash));
     return compression !== COMPRESSION_ALGORITHMS.NONE
@@ -274,9 +277,9 @@ export async function readFile(manifestPath, {
         ? await limit(() => brotliDecompressAsync(block))
         : await limit(() => inflateAsync(block))
       : block;
-  }));
+  });
 
-  return Buffer.concat(blocks);
+  return Buffer.concat(await Promise.all(blockPromises));
 }
 
 /**
@@ -319,48 +322,42 @@ export async function verifyFile(filePath, manifestPath, {
     let totalBytesReadFromFile = 0;
 
     const processBlock = async (fileBlockChunk, isLastBlock = false) => {
-      try {
-        if (manifestHashIndex >= manifestHashes.length) {
-          fileStream.destroy();
-          reject(new Error('File contains more blocks than specified in the manifest.'));
-          return false;
-        }
-
-        let blockToHash = fileBlockChunk;
-        const compression = blockCompression[manifestHashIndex];
-        if (compression !== COMPRESSION_ALGORITHMS.NONE) {
-          blockToHash = compression === COMPRESSION_ALGORITHMS.BROTLI
-            ? await limit(() => brotliCompressAsync(fileBlockChunk, {
-                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 }
-              }))
-            : await limit(() => deflateAsync(fileBlockChunk));
-        }
-
-        const computedFileBlockHash = hashBuffer(blockToHash);
-        const expectedManifestHash = manifestHashes[manifestHashIndex];
-
-        if (computedFileBlockHash !== expectedManifestHash) {
-          fileStream.destroy();
-          reject(new Error(`Hash mismatch for file block ${manifestHashIndex + 1}: expected ${expectedManifestHash}, got ${computedFileBlockHash}`));
-          return false;
-        }
-
-        const storedBlock = await limit(() => readBlock(blockDir, expectedManifestHash));
-        const storedBlockHash = hashBuffer(storedBlock);
-        if (storedBlockHash !== expectedManifestHash) {
-          fileStream.destroy();
-          reject(new Error(`Stored block ${manifestHashIndex + 1} is corrupted or does not match manifest: expected ${expectedManifestHash}, got ${storedBlockHash}`));
-          return false;
-        }
-
-        if (verbose) console.log(`Verified block ${manifestHashIndex + 1}/${manifestHashes.length} (hash: ${expectedManifestHash})`);
-        manifestHashIndex++;
-        return true;
-      } catch (err) {
+      if (manifestHashIndex >= manifestHashes.length) {
         fileStream.destroy();
-        reject(err);
+        reject(new Error('File contains more blocks than specified in the manifest.'));
         return false;
       }
+
+      let blockToHash = fileBlockChunk;
+      const compression = blockCompression[manifestHashIndex];
+      if (compression !== COMPRESSION_ALGORITHMS.NONE) {
+        blockToHash = compression === COMPRESSION_ALGORITHMS.BROTLI
+          ? await limit(() => brotliCompressAsync(fileBlockChunk, {
+              params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 }
+            }))
+          : await limit(() => deflateAsync(fileBlockChunk));
+      }
+
+      const computedFileBlockHash = hashBuffer(blockToHash);
+      const expectedManifestHash = manifestHashes[manifestHashIndex];
+
+      if (computedFileBlockHash !== expectedManifestHash) {
+        fileStream.destroy();
+        reject(new Error(`Hash mismatch for file block ${manifestHashIndex + 1}: expected ${expectedManifestHash}, got ${computedFileBlockHash}`));
+        return false;
+      }
+
+      const storedBlock = await limit(() => readBlock(blockDir, expectedManifestHash));
+      const storedBlockHash = hashBuffer(storedBlock);
+      if (storedBlockHash !== expectedManifestHash) {
+        fileStream.destroy();
+        reject(new Error(`Stored block ${manifestHashIndex + 1} is corrupted or does not match manifest: expected ${expectedManifestHash}, got ${storedBlockHash}`));
+        return false;
+      }
+
+      if (verbose) console.log(`Verified block ${manifestHashIndex + 1}/${manifestHashes.length} (hash: ${expectedManifestHash})`);
+      manifestHashIndex++;
+      return true;
     };
 
     fileStream.on('data', async (chunk) => {
@@ -469,7 +466,7 @@ export async function writeFile(filename, buffer, {
       let blockToStore = chunk;
       let actualCompression = COMPRESSION_ALGORITHMS.NONE;
 
-      if (compress && chunk.length >= 100) {
+      if (compress && chunk.length >= 1024) { // Skip compression for small blocks
         const entropy = estimateEntropy(chunk);
         if (entropy < 6.0) {
           actualCompression = metadata.compressionAlgorithm;
