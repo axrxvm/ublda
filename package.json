@@ -8,7 +8,7 @@
     "ublda": "./bin/cli.js"
   },
   "scripts": {
-    "test": "node test/ublda.test.js",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
     "example": "node example.js"
   },
   "keywords": [
@@ -21,8 +21,12 @@
   "license": "MIT",
   "dependencies": {
     "commander": "^9.4.1",
-    "fs-extra": "^10.1.0",
     "p-limit": "^3.1.0",
     "progress": "^2.0.3"
+  },
+  "devDependencies": {
+    "crypto": "^1.0.1",
+    "fs-extra": "^11.3.0",
+    "jest": "^29.7.0"
   }
 }

@@ -4,8 +4,17 @@ import { Readable } from 'stream';
 import zlib from 'zlib';
 import { promisify } from 'util';
 import { readBlock } from './storage.js';
+// Import hashBuffer to fix verifyHashes bug
+import { hashBuffer } from './hasher.js';
 
 const inflateAsync = promisify(zlib.inflate);
+const brotliDecompressAsync = promisify(zlib.brotliDecompress);
+
+const COMPRESSION_ALGORITHMS = { // Define here for local use, though passed in options
+  DEFLATE: 'deflate',
+  BROTLI: 'brotli',
+  NONE: 'none',
+};
 
 /**
  * Splits a file into blocks.
@@ -61,7 +70,12 @@ export async function writeFileFromBlocks(outputPath, blocks) {
  * @param {object} [options]
  * @returns {Readable}
  */
-export function createReadStreamFromBlocks(blockDir, hashes, { compress = false, verifyHashes = false, verbose = false } = {}) {
+export function createReadStreamFromBlocks(blockDir, hashes, {
+  compress = false,
+  compressionAlgorithm = COMPRESSION_ALGORITHMS.DEFLATE, // Added option
+  verifyHashes = false,
+  verbose = false
+} = {}) {
   let index = 0;
 
   return new Readable({
@@ -73,13 +87,27 @@ export function createReadStreamFromBlocks(blockDir, hashes, { compress = false,
 
       try {
         const hash = hashes[index];
-        const block = await readBlock(blockDir, hash);
-        let data = compress ? await inflateAsync(block) : block;
+        const rawBlock = await readBlock(blockDir, hash); // Renamed to rawBlock for clarity
+
         if (verifyHashes) {
-          const computedHash = hashBuffer(data);
-          if (computedHash !== hash) throw new Error(`Hash mismatch for block ${index + 1}`);
+          // IMPORTANT FIX: Hash the raw block *before* decompression
+          const computedHash = hashBuffer(rawBlock);
+          if (computedHash !== hash) {
+            this.emit('error', new Error(`Hash mismatch for block ${index + 1}: expected ${hash}, got ${computedHash}`));
+            return;
+          }
         }
-        this.push(data);
+
+        let dataToPush = rawBlock;
+        if (compress) {
+          if (compressionAlgorithm === COMPRESSION_ALGORITHMS.BROTLI) {
+            dataToPush = await brotliDecompressAsync(rawBlock);
+          } else { // Default to deflate for backward compatibility or if 'deflate' specified
+            dataToPush = await inflateAsync(rawBlock);
+          }
+        }
+
+        this.push(dataToPush);
         if (verbose) console.log(`Streamed block ${index + 1}/${hashes.length} (hash: ${hash})`);
         index++;
       } catch (error) {
