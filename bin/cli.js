@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import ProgressBar from 'progress';
-import { storeFile, restoreFile, readFile, writeFile, verifyFile, cleanupBlocks } from './src/index.js';
+import { storeFile, restoreFile, readFile, writeFile, verifyFile, cleanupBlocks } from '../src/index.js';
 import fs from 'fs-extra';
 
 const program = new Command();
