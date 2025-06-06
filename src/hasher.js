@@ -1,4 +1,4 @@
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 
 // Lightweight array-based hash cache (max 2000 entries)
 const hashCache = [];

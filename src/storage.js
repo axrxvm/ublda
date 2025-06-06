@@ -1,5 +1,5 @@
-import path from 'path';
-import fs from 'fs/promises';
+import path from 'node:path';
+import fs from 'node:fs/promises';
 
 // Minimal FIFO cache for blocks (max 2MB)
 const blockCache = new Map();

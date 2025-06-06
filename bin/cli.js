@@ -9,7 +9,7 @@ const program = new Command();
 program
   .name('ublda')
   .description('Universal Block-Level Data Accelerator')
-  .version('1.0.0');
+  .version('1.1.5');
 
 program
   .command('store')

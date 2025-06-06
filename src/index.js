@@ -1,14 +1,14 @@
-import path from 'path';
+import path from 'node:path';
 import fs from 'fs-extra';
-import zlib from 'zlib';
-import { pipeline } from 'stream/promises';
-import { promisify } from 'util';
+import zlib from 'node:zlib';
+import { pipeline } from 'node:stream/promises';
+import { promisify } from 'node:util';
 import pLimit from 'p-limit';
 import { splitFile, writeFileFromBlocks, createReadStreamFromBlocks } from './file.js';
 import { hashBuffer } from './hasher.js';
 import { writeBlocksBatch, readBlock } from './storage.js';
 import { saveManifest, loadManifest } from './manifest.js';
-import os from 'os';
+import os from 'node:os';
 
 const limit = pLimit(Math.max(4, os.cpus().length)); // Balanced concurrency
 const deflateAsync = promisify(zlib.deflate);
@@ -479,4 +479,37 @@ export async function writeFile(filename, buffer, {
   await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
 
   return { manifestPath, blockCount: hashes.length, totalSize: buffer.length };
+}
+
+/**
+ * Cleans up unused blocks in the storage directory.
+ * @param {string} storageDir
+ * @param {object} [options]
+ * @returns {Promise<number>}
+ */
+export async function cleanupBlocks(storageDir = './storage', { verbose = false } = {}) {
+  const blockDir = path.join(storageDir, 'blocks');
+  const manifestDir = path.join(storageDir, 'manifests');
+  if (!(await pathExists(blockDir))) throw new Error(`Block directory not found: ${blockDir}`);
+  if (!(await pathExists(manifestDir))) throw new Error(`Manifest directory not found: ${manifestDir}`);
+
+  const blockFiles = await fs.readdir(blockDir);
+  const manifests = await fs.readdir(manifestDir);
+  const usedHashes = new Set();
+
+  for (const manifest of manifests) {
+    const { hashes } = await loadManifest(path.join(manifestDir, manifest));
+    hashes.forEach(hash => usedHashes.add(hash));
+  }
+
+  let deletedCount = 0;
+  for (const blockFile of blockFiles) {
+    if (!usedHashes.has(blockFile)) {
+      await fs.unlink(path.join(blockDir, blockFile));
+      deletedCount++;
+      if (verbose) console.log(`Deleted unused block: ${blockFile}`);
+    }
+  }
+
+  return deletedCount;
 }

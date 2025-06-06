@@ -1,8 +1,8 @@
-import fs from 'fs/promises';
-import { access, constants } from 'fs/promises';
-import { Readable } from 'stream';
-import zlib from 'zlib';
-import { promisify } from 'util';
+import fs from 'node:fs/promises';
+import { access, constants } from 'node:fs/promises';
+import { Readable } from 'node:stream';
+import zlib from 'node:zlib';
+import { promisify } from 'node:util';
 import { readBlock } from './storage.js';
 import { hashBuffer } from './hasher.js';
 
