@@ -1,10 +1,10 @@
 import path from 'node:path';
 import fs from 'node:fs/promises';
 
-// Minimal FIFO cache for blocks (max 2MB)
+// Minimal FIFO cache for blocks (max 32MB)
 const blockCache = new Map();
 const blockQueue = [];
-const MAX_CACHE_SIZE = 2 * 1024 * 1024; // 2MB
+const MAX_CACHE_SIZE = 32 * 1024 * 1024; // 32MB
 let currentCacheSize = 0;
 
 // Cache for existence checks

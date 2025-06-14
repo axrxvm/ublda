@@ -16,6 +16,9 @@ const inflateAsync = promisify(zlib.inflate);
 const brotliCompressAsync = promisify(zlib.brotliCompress);
 const brotliDecompressAsync = promisify(zlib.brotliDecompress);
 
+const DEFAULT_BROTLI_QUALITY = 2; // zlib.constants.BROTLI_PARAM_QUALITY is often 11 for general, 2 for fast
+const DEFAULT_DEFLATE_LEVEL = zlib.constants.Z_BEST_SPEED;
+
 const COMPRESSION_ALGORITHMS = {
   DEFLATE: 'deflate',
   BROTLI: 'brotli',
@@ -41,6 +44,8 @@ export async function storeFile(filePath, {
   compress = true,
   verbose = false,
   compressionAlgorithm = COMPRESSION_ALGORITHMS.BROTLI,
+  brotliQuality = DEFAULT_BROTLI_QUALITY,
+  deflateLevel = DEFAULT_DEFLATE_LEVEL,
 } = {}) {
   if (!(await fs.access(filePath).then(() => true).catch(() => false))) throw new Error(`File not found: ${filePath}`);
   if (blockSize <= 0) throw new Error('Block size must be positive');
@@ -85,57 +90,173 @@ export async function storeFile(filePath, {
     compress,
     compressionAlgorithm: compress ? compressionAlgorithm : COMPRESSION_ALGORITHMS.NONE,
     originalName: fileName,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    compressionParams: null, // Will be populated if compression happens
   };
+
+  if (compress) {
+    if (metadata.compressionAlgorithm === COMPRESSION_ALGORITHMS.BROTLI) {
+      metadata.compressionParams = { quality: brotliQuality };
+    } else if (metadata.compressionAlgorithm === COMPRESSION_ALGORITHMS.DEFLATE) {
+      metadata.compressionParams = { level: deflateLevel };
+    }
+  }
 
   const stream = fs.createReadStream(filePath, { highWaterMark: blockSize });
   const hashes = [];
   const blockCompression = [];
   const blocksToWrite = [];
   let blockIndex = 0;
+  const processingQueue = [];
+  let isProcessingQueue = false;
+  let streamPaused = false;
+  const PROCESSING_QUEUE_HIGH_WATER_MARK = Math.max(8, os.cpus().length * 2); // Concurrency for processing
+  const PROCESSING_QUEUE_LOW_WATER_MARK = Math.max(4, os.cpus().length);
+  let streamEnded = false; // Flag to indicate that the 'end' event has fired
 
-  return new Promise((resolve, reject) => {
-    stream.on('data', async (chunk) => {
-      if (chunk.length === 0) return;
+  async function processQueue() {
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
 
-      stream.pause();
-      blockIndex++;
-      let processedBlock = chunk;
-      let actualCompression = COMPRESSION_ALGORITHMS.NONE;
+    try {
+      while (processingQueue.length > 0) {
+        const { chunk, blockIndex: originalChunkIndex } = processingQueue.shift();
 
-      if (compress && shouldCompress(fileName, chunk)) {
-        actualCompression = metadata.compressionAlgorithm;
-        try {
-          processedBlock = actualCompression === COMPRESSION_ALGORITHMS.BROTLI
-            ? await limit(() => brotliCompressAsync(chunk, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 } }))
-            : await limit(() => deflateAsync(chunk));
-          if (processedBlock.length >= chunk.length) {
+        let processedBlock = chunk;
+        let actualCompression = COMPRESSION_ALGORITHMS.NONE;
+
+        if (compress && shouldCompress(fileName, chunk)) {
+          actualCompression = metadata.compressionAlgorithm; // This is the target algorithm
+          let currentCompressionParams = {};
+          try {
+            if (actualCompression === COMPRESSION_ALGORITHMS.BROTLI) {
+              currentCompressionParams = { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: brotliQuality } };
+              processedBlock = await limit(() => brotliCompressAsync(chunk, currentCompressionParams));
+            } else if (actualCompression === COMPRESSION_ALGORITHMS.DEFLATE) {
+              currentCompressionParams = { level: deflateLevel };
+              processedBlock = await limit(() => deflateAsync(chunk, currentCompressionParams));
+            } else { // Should not happen if actualCompression is BROTLI or DEFLATE
+              processedBlock = chunk;
+              actualCompression = COMPRESSION_ALGORITHMS.NONE;
+            }
+
+            if (processedBlock.length >= chunk.length) { // If compression is ineffective
+              processedBlock = chunk;
+              actualCompression = COMPRESSION_ALGORITHMS.NONE;
+              // No specific compressionParams if NONE
+            }
+          } catch (err) {
+            if (verbose) console.warn(`Compression failed for block index ${originalChunkIndex} with ${actualCompression}, using original. Error: ${err.message}`);
             processedBlock = chunk;
             actualCompression = COMPRESSION_ALGORITHMS.NONE;
           }
-        } catch {
-          processedBlock = chunk;
+        } else { // Not compressing this block
           actualCompression = COMPRESSION_ALGORITHMS.NONE;
         }
+
+        const hash = hashBuffer(processedBlock);
+        hashes.push(hash);
+        blockCompression.push(actualCompression); // Store the actual compression used for this block
+
+        blocksToWrite.push({ hash, data: processedBlock });
+
+        if (blocksToWrite.length >= 8) {
+          const batchToWrite = blocksToWrite.splice(0, 8);
+          await limit(() => writeBlocksBatch(blockDir, batchToWrite, { verbose }));
+        }
+
+        if (streamPaused && processingQueue.length < PROCESSING_QUEUE_LOW_WATER_MARK) {
+          stream.resume();
+          streamPaused = false;
+          if (verbose) console.log('Stream resumed, processing queue below low water mark.');
+        }
+      }
+    } catch (err) {
+      isProcessingQueue = false; // Ensure flag is reset on error
+      stream.destroy(err); // Destroy stream with error to propagate to 'error' and 'close' events
+      // Error will be caught by the .catch(reject) where processQueue() is invoked from 'data' or 'end' handler
+      throw err;
+    } finally {
+      isProcessingQueue = false;
+      // The 'end' handler is now responsible for ensuring all blocks are written after
+      // the queue is empty and stream has ended.
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    stream.on('data', (chunk) => {
+      if (chunk.length === 0) return;
+      if (stream.destroyed) return; // Don't process if stream is already destroyed
+
+      blockIndex++; // This counter is for the number of chunks read from stream
+      processingQueue.push({ chunk, blockIndex: blockIndex - 1 });
+
+      if (!isProcessingQueue) {
+        processQueue().catch(processError => {
+          // If processQueue encounters an error, it should call stream.destroy(error).
+          // This will trigger the stream's 'error' event, which then rejects the main promise.
+          // So, we just need to ensure stream is destroyed if it hasn't been already.
+          if (!stream.destroyed) {
+            stream.destroy(processError);
+          }
+          // Do not call reject() here; let the stream 'error' event handle it.
+        });
       }
 
-      const hash = hashBuffer(processedBlock);
-      blocksToWrite.push({ hash, data: processedBlock });
-      hashes.push(hash);
-      blockCompression.push(actualCompression);
-
-      if (blocksToWrite.length >= 8) { // Batch writes
-        await limit(() => writeBlocksBatch(blockDir, blocksToWrite.splice(0), { verbose }));
+      if (processingQueue.length >= PROCESSING_QUEUE_HIGH_WATER_MARK && !streamPaused && !stream.destroyed) {
+        stream.pause();
+        streamPaused = true;
+        if (verbose) console.log('Stream paused due to high processing queue');
       }
-
-      stream.resume();
     });
 
     stream.on('end', async () => {
-      if (blocksToWrite.length > 0) {
-        await limit(() => writeBlocksBatch(blockDir, blocksToWrite, { verbose }));
+      if (verbose) console.log('Stream ended. Starting final processing and writes.');
+      streamEnded = true; // Signal that stream has ended
+
+      try {
+        // Ensure any ongoing processing finishes or new processing is triggered if queue still has items
+        if (!isProcessingQueue && processingQueue.length > 0) {
+          await processQueue(); // Wait for it to complete
+        } else {
+          // If processQueue is already running, wait for it to naturally empty the queue.
+          while (isProcessingQueue || processingQueue.length > 0) {
+            await new Promise(r => setTimeout(r, 50));
+          }
+        }
+
+        // After all processing is done, write any remaining blocks
+        if (blocksToWrite.length > 0) {
+          if (verbose) console.log(`Writing final ${blocksToWrite.length} blocks.`);
+          const finalBatch = blocksToWrite.splice(0, blocksToWrite.length);
+          await limit(() => writeBlocksBatch(blockDir, finalBatch, { verbose }));
+        }
+
+        // All data processed and written, finalize manifest
+        const manifestPath = path.join(manifestDir, `${fileName}.manifest.json`);
+        await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
+        resolve({ manifestPath, blockCount: hashes.length });
+      } catch (err) {
+        // Ensure stream is destroyed on any error during 'end' processing
+        if (!stream.destroyed) {
+            stream.destroy(err);
+        }
+        reject(err);
       }
-      const manifestPath = path.join(manifestDir, `${fileName}.manifest.json`);
+    });
+
+    stream.on('error', (err) => {
+        // This handler will catch errors from stream.destroy(err) calls elsewhere
+        // and also direct stream errors.
+        if (verbose) console.error('Stream error event:', err.message);
+        // Clean up resources or ensure processing stops
+        isProcessingQueue = false; // Stop any further processing attempts by new calls
+        processingQueue.length = 0; // Clear queue
+        blocksToWrite.length = 0; // Clear pending writes
+        reject(new Error(`Stream or processing error: ${err.message}`));
+    });
+  });
+}
       await fs.writeJson(manifestPath, { hashes, blockCompression, metadata });
       resolve({ manifestPath, blockCount: hashes.length });
     });
@@ -169,13 +290,23 @@ export async function restoreFile(manifestPath, outputPath, {
     return;
   }
 
-  if (hashes.length === 0 || metadata.originalSize === 0) {
-    throw new Error('Manifest is invalid: inconsistent hashes and originalSize.');
+  // It's possible for a file to have content but result in zero blocks if all blocks were empty after processing (e.g. large sparse file)
+  // However, the current storeFile logic does not produce zero hashes for non-empty originalSize.
+  // This check is more about manifest integrity.
+  if (hashes.length === 0 && metadata.originalSize > 0) {
+    throw new Error('Manifest is invalid: no hashes for a non-empty file.');
   }
+
 
   const outputStream = fs.createWriteStream(outputPath);
   await pipeline(
-    createReadStreamFromBlocks(blockDir, hashes, { blockCompression, verbose, compress: metadata.compress, compressionAlgorithm: metadata.compressionAlgorithm }),
+    createReadStreamFromBlocks(blockDir, hashes, {
+      blockCompression,
+      verbose,
+      // compress: metadata.compress, // Less relevant now, covered by compressionAlgorithm
+      compressionAlgorithm: metadata.compressionAlgorithm,
+      limit // Pass the pLimit instance
+    }),
     outputStream
   );
 }
@@ -201,13 +332,18 @@ export async function readFile(manifestPath, {
   if (!Array.isArray(hashes) || !Array.isArray(blockCompression) || hashes.length !== blockCompression.length) {
     throw new Error('Invalid manifest: hashes or blockCompression is missing or inconsistent.');
   }
+  if (hashes.length === 0 && metadata.originalSize > 0) { // Similar check as in restoreFile
+    throw new Error('Manifest is invalid: no hashes for a non-empty file.');
+  }
+
 
   if (stream) {
     return createReadStreamFromBlocks(blockDir, hashes, {
-      compress: metadata.compress,
+      // compress: metadata.compress, // Less relevant now, covered by compressionAlgorithm
       compressionAlgorithm: metadata.compressionAlgorithm,
       verbose,
-      blockCompression
+      blockCompression,
+      limit // Pass the pLimit instance
     });
   }
 
@@ -369,6 +505,8 @@ export async function writeFile(filename, buffer, {
   compress = true,
   verbose = false,
   compressionAlgorithm = COMPRESSION_ALGORITHMS.BROTLI,
+  brotliQuality = DEFAULT_BROTLI_QUALITY,
+  deflateLevel = DEFAULT_DEFLATE_LEVEL,
 } = {}) {
   if (!filename) throw new Error('Filename is required');
   if (!(buffer instanceof Buffer)) throw new Error('Input must be a Buffer');
@@ -417,12 +555,20 @@ export async function writeFile(filename, buffer, {
     await writeBlocksBatch(blocksDir, [{ hash, data: processedBlock }], { verbose });
     const metadata = {
       originalSize: buffer.length,
-      blockSize: buffer.length,
-      compress,
-      compressionAlgorithm: actualCompression,
+      blockSize: buffer.length, // For single-block files, blockSize in metadata is file size
+      compress, // Overall intention to compress
+      compressionAlgorithm: actualCompression, // Actual algorithm used for this block
       originalName: filename,
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      compressionParams: null,
     };
+    if (actualCompression === COMPRESSION_ALGORITHMS.BROTLI) {
+      metadata.compressionParams = { quality: brotliQuality };
+    } else if (actualCompression === COMPRESSION_ALGORITHMS.DEFLATE) {
+      metadata.compressionParams = { level: deflateLevel };
+    }
+    // If actualCompression is NONE, compressionParams remains null
+
     const manifestPath = path.join(manifestsDir, `${filename}.manifest.json`);
     await fs.writeJson(manifestPath, { hashes: [hash], blockCompression: [actualCompression], metadata });
     return { manifestPath, blockCount: 1, totalSize: buffer.length };
@@ -436,38 +582,68 @@ export async function writeFile(filename, buffer, {
     compress,
     compressionAlgorithm: compress ? compressionAlgorithm : COMPRESSION_ALGORITHMS.NONE,
     originalName: filename,
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
+    compressionParams: null, // Will be populated if compression happens
   };
+
+  if (compress) {
+    if (metadata.compressionAlgorithm === COMPRESSION_ALGORITHMS.BROTLI) {
+      metadata.compressionParams = { quality: brotliQuality };
+    } else if (metadata.compressionAlgorithm === COMPRESSION_ALGORITHMS.DEFLATE) {
+      metadata.compressionParams = { level: deflateLevel };
+    }
+  }
+
   const blocksToWrite = [];
 
   for (let offset = 0; offset < buffer.length; offset += blockSize) {
     const chunk = buffer.slice(offset, offset + blockSize);
     let blockToStore = chunk;
-    let actualCompression = COMPRESSION_ALGORITHMS.NONE;
+    let actualCompressionForBlock = COMPRESSION_ALGORITHMS.NONE; // Actual compression for *this specific block*
 
     if (compress && shouldCompress(filename, chunk)) {
-      actualCompression = metadata.compressionAlgorithm;
+      actualCompressionForBlock = metadata.compressionAlgorithm; // Target algorithm
+      let currentCompressionParams = {};
       try {
-        blockToStore = actualCompression === COMPRESSION_ALGORITHMS.BROTLI
-          ? await limit(() => brotliCompressAsync(chunk, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 2 } }))
-          : await limit(() => deflateAsync(chunk));
-        if (blockToStore.length >= chunk.length) {
+        if (actualCompressionForBlock === COMPRESSION_ALGORITHMS.BROTLI) {
+          currentCompressionParams = { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: brotliQuality } };
+          blockToStore = await limit(() => brotliCompressAsync(chunk, currentCompressionParams));
+        } else if (actualCompressionForBlock === COMPRESSION_ALGORITHMS.DEFLATE) {
+          currentCompressionParams = { level: deflateLevel };
+          blockToStore = await limit(() => deflateAsync(chunk, currentCompressionParams));
+        } else {
           blockToStore = chunk;
-          actualCompression = COMPRESSION_ALGORITHMS.NONE;
+          actualCompressionForBlock = COMPRESSION_ALGORITHMS.NONE;
+        }
+
+        if (blockToStore.length >= chunk.length) { // If compression is ineffective
+          blockToStore = chunk;
+          actualCompressionForBlock = COMPRESSION_ALGORITHMS.NONE;
         }
       } catch (err) {
+        if (verbose) console.warn(`Compression failed for a block in writeFile with ${actualCompressionForBlock}, using original. Error: ${err.message}`);
         blockToStore = chunk;
-        actualCompression = COMPRESSION_ALGORITHMS.NONE;
+        actualCompressionForBlock = COMPRESSION_ALGORITHMS.NONE;
       }
+    } else {
+      actualCompressionForBlock = COMPRESSION_ALGORITHMS.NONE;
     }
 
     const hash = hashBuffer(blockToStore);
     blocksToWrite.push({ hash, data: blockToStore });
     hashes.push(hash);
-    blockCompression.push(actualCompression);
+    blockCompression.push(actualCompressionForBlock); // Store actual compression for the block
 
     if (blocksToWrite.length >= 8) {
-      await limit(() => writeBlocksBatch(blocksDir, blocksToWrite.splice(0), { verbose }));
+      // Note: blocksToWrite.splice(0) was used before, ensure this is intended.
+      // Assuming it means blocksToWrite.splice(0, blocksToWrite.length) or similar for batching.
+      // The previous code used blocksToWrite.splice(0, 8) or blocksToWrite.splice(0, blocksToWrite.length)
+      // For now, sticking to the logic of previous step which was blocksToWrite.splice(0, 8)
+      // This part seems unrelated to the current change, but noting the splice behavior.
+      // The refactored storeFile uses blocksToWrite.splice(0, 8) or .splice(0, finalBatch.length)
+      // Here, it seems like it should be a fixed batch or all.
+      // Let's assume it means a batch of 8.
+      await limit(() => writeBlocksBatch(blocksDir, blocksToWrite.splice(0, 8), { verbose }));
     }
   }
 

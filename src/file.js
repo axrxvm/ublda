@@ -66,28 +66,92 @@ export function createReadStreamFromBlocks(blockDir, hashes, {
   verbose = false,
   blockCompression = [],
 } = {}) {
-  let index = 0;
+  compress = false, // Original option, now less directly used by the stream itself for default
+  compressionAlgorithm = COMPRESSION_ALGORITHMS.DEFLATE, // Default if not in blockCompression
+  verbose = false,
+  blockCompression = [], // Array of compression types per block
+  limit = null, // pLimit instance
+} = {}) {
+  if (!limit) {
+    // Fallback to a dummy limiter if none is provided, though actual concurrency won't be achieved.
+    // Or, throw an error: throw new Error('pLimit instance (options.limit) is required.');
+    // For now, let's make it required.
+    throw new Error('pLimit instance (options.limit) is required for createReadStreamFromBlocks.');
+  }
+
+  // Helper async generator
+  async function* processBlocksGenerator() {
+    const taskPromises = [];
+
+    for (let i = 0; i < hashes.length; i++) {
+      const hash = hashes[i];
+      // Determine the actual compression for this block:
+      // 1. Use specific blockCompression[i] if available.
+      // 2. Fallback to options.compress (implicitly, via compressionAlgorithm) if not.
+      // The `compress` flag itself is less important now than the `blockCompression` array or `compressionAlgorithm`
+      const blockSpecificCompression = blockCompression[i] || compressionAlgorithm;
+
+      if (verbose) console.log(`[BlockReadStream] Scheduling block ${i} (hash: ${hash}, compression: ${blockSpecificCompression})`);
+
+      const taskPromise = limit(async () => {
+        try {
+          if (verbose) console.log(`[BlockReadStream] Reading block ${i} (hash: ${hash})`);
+          const rawBlock = await readBlock(blockDir, hash);
+
+          if (blockSpecificCompression === COMPRESSION_ALGORITHMS.NONE) {
+            if (verbose) console.log(`[BlockReadStream] Finished block ${i} (hash: ${hash}, no decompression)`);
+            return rawBlock;
+          }
+
+          if (verbose) console.log(`[BlockReadStream] Decompressing block ${i} (hash: ${hash}, method: ${blockSpecificCompression})`);
+          const decompressedData = blockSpecificCompression === COMPRESSION_ALGORITHMS.BROTLI
+            ? await brotliDecompressAsync(rawBlock)
+            : await inflateAsync(rawBlock);
+          if (verbose) console.log(`[BlockReadStream] Finished block ${i} (hash: ${hash})`);
+          return decompressedData;
+        } catch (error) {
+          // Decorate error with more context before it's re-thrown by limit and caught by generator's consumer
+          const contextError = new Error(`Error processing block ${i} (hash: ${hash}): ${error.message}`);
+          contextError.stack = error.stack; // Preserve original stack
+          contextError.originalError = error;
+          throw contextError;
+        }
+      });
+      taskPromises.push(taskPromise); // Store promise, not {promise, index} as order is preserved by awaiting this array.
+    }
+
+    // Yield promises in order they were added (and should be processed)
+    for (let i = 0; i < taskPromises.length; i++) {
+      try {
+        yield await taskPromises[i];
+      } catch (error) {
+        // This will catch errors from the limit-wrapped function
+        // and propagate them to the stream's error handler via blockProcessor.next()
+        throw error; // Re-throw to be caught by the stream's read method
+      }
+    }
+  }
+
+  const blockProcessor = processBlocksGenerator();
 
   return new Readable({
     async read() {
-      if (index >= hashes.length) {
-        this.push(null);
-        return;
-      }
-
-      const hash = hashes[index];
-      const compression = blockCompression[index] || (compress ? compressionAlgorithm : COMPRESSION_ALGORITHMS.NONE);
       try {
-        const rawBlock = await readBlock(blockDir, hash);
-        const data = compression === COMPRESSION_ALGORITHMS.NONE
-          ? rawBlock
-          : compression === COMPRESSION_ALGORITHMS.BROTLI
-            ? await brotliDecompressAsync(rawBlock)
-            : await inflateAsync(rawBlock);
-        this.push(data);
-        index++;
-      } catch (error) {
-        this.emit('error', new Error(`Failed to stream block ${index + 1}: ${error.message}`));
+        const { value, done } = await blockProcessor.next();
+        if (done) {
+          this.push(null); // Signal end of stream
+        } else {
+          if (!this.push(value)) {
+            // If push returns false, it means the consumer is not ready (backpressure)
+            // The stream will automatically stop calling _read until the consumer is ready again.
+            // The generator will pause at the await blockProcessor.next() until read() is called again.
+            if (verbose) console.log('[BlockReadStream] Backpressure applied.');
+          }
+        }
+      } catch (e) {
+        // Emit error on the stream
+        if (verbose) console.error(`[BlockReadStream] Error: ${e.message}`);
+        this.emit('error', e);
       }
     }
   });
