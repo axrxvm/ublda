@@ -149,7 +149,7 @@ async function example() {
 
 example();
 ```
-For detailed information on all exported functions, parameters, and advanced usage, please refer to the [USAGE.md](./USAGE.md) file (which you will create in the next step).
+For detailed information on all exported functions, parameters, and advanced usage, please refer to the [USAGE.md](./USAGE.md) file.
 
 ## License
 
